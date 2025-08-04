@@ -367,7 +367,7 @@ class SimpleGoogleScraper:
         return results
     
     async def search(self, keyword: str, country: str = 'nl') -> List[Dict[str, Any]]:
-        """Perform Google search with better browser simulation"""
+        """Perform Google search with proper decompression"""
         await self.rate_limit()
         
         url = self.build_url(keyword, country)
@@ -391,40 +391,71 @@ class SimpleGoogleScraper:
             response = session.get(url, headers=headers, timeout=20)
             response.raise_for_status()
             
-            # Check encoding
-            if response.encoding is None:
-                response.encoding = 'utf-8'
-            
+            # IMPORTANT: Let requests handle decompression automatically
+            # Don't manually set encoding - let requests detect it
             html = response.text
-            logger.info(f"📡 Status: {response.status_code}, Length: {len(html)}")
+            
+            logger.info(f"📡 Status: {response.status_code}")
+            logger.info(f"📏 Length: {len(html)} characters")
+            logger.info(f"🔤 Encoding: {response.encoding}")
+            logger.info(f"📦 Content-Encoding header: {response.headers.get('content-encoding', 'none')}")
+            
+            # Check if we got readable HTML by looking at first 100 chars
+            html_start = html[:100]
+            logger.info(f"📄 HTML start: {html_start}")
+            
+            # If we still get binary, try manual decompression
+            if not any(marker in html_start.lower() for marker in ['<!doctype', '<html', '<head', '<title']):
+                logger.warning("🔄 Trying manual decompression...")
+                
+                # Try to decompress manually
+                import gzip
+                import zlib
+                
+                try:
+                    # Try gzip first
+                    if response.headers.get('content-encoding') == 'gzip':
+                        html = gzip.decompress(response.content).decode('utf-8', errors='ignore')
+                        logger.info("✅ Gzip decompression successful")
+                    elif response.headers.get('content-encoding') == 'deflate':
+                        html = zlib.decompress(response.content).decode('utf-8', errors='ignore')
+                        logger.info("✅ Deflate decompression successful")
+                    else:
+                        # Try both anyway
+                        try:
+                            html = gzip.decompress(response.content).decode('utf-8', errors='ignore')
+                            logger.info("✅ Force gzip decompression successful")
+                        except:
+                            html = response.content.decode('utf-8', errors='ignore')
+                            logger.info("✅ Raw decode successful")
+                            
+                except Exception as decomp_error:
+                    logger.error(f"❌ Decompression failed: {decomp_error}")
+                    html = response.content.decode('utf-8', errors='ignore')
+            
+            # Log the corrected HTML start
+            corrected_start = html[:200]
+            logger.info(f"📄 Corrected HTML start: {corrected_start}")
             
             # Check for JavaScript redirect page
             if 'enablejs' in html.lower() or len(html) < 20000:
-                logger.warning("⚠️ Got JavaScript redirect page - trying alternative approach")
-                
-                # Try with different headers
-                alt_headers = headers.copy()
-                alt_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                alt_headers.pop('sec-ch-ua', None)
-                alt_headers.pop('sec-ch-ua-mobile', None)
-                alt_headers.pop('sec-ch-ua-platform', None)
-                
-                await asyncio.sleep(2)
-                response = session.get(url, headers=alt_headers, timeout=20)
-                html = response.text
-                logger.info(f"📡 Alternative attempt - Status: {response.status_code}, Length: {len(html)}")
+                logger.warning("⚠️ Got JavaScript redirect page")
+                session.close()
+                return []
             
             # Check for blocking
             if any(block in html.lower() for block in ['unusual traffic', 'captcha', 'blocked']):
                 logger.warning("🚫 Google blocking detected")
+                session.close()
                 return []
-                
-            # Basic HTML check
-            if not ('<!DOCTYPE html' in html or '<html' in html):
-                logger.warning("⚠️ Invalid HTML response")
-                logger.info(f"Response start: {html[:200]}")
+            
+            # Check if we have valid HTML
+            if not any(marker in html.lower() for marker in ['<!doctype html', '<html', '<head', '<title']):
+                logger.warning("⚠️ Still no valid HTML after decompression")
+                session.close()
                 return []
-                
+            
+            logger.info("✅ Got valid HTML content")
             results = self.extract_results(html)
             session.close()
             return results

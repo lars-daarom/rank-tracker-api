@@ -426,7 +426,7 @@ class GoogleRankTracker:
         headers = self.get_random_headers()
         
         logger.info(f"🔍 Searching Google: '{keyword}' in {country.upper()}")
-        logger.debug(f"URL: {url}")
+        logger.info(f"🌐 URL: {url[:100]}...")
         
         try:
             response = self.session.get(
@@ -437,26 +437,61 @@ class GoogleRankTracker:
             )
             response.raise_for_status()
             
+            logger.info(f"📡 Response status: {response.status_code}")
+            logger.info(f"📏 Response length: {len(response.text)} characters")
+            
             # Check for blocking indicators
             content_lower = response.text.lower()
-            if any(indicator in content_lower for indicator in [
-                'unusual traffic', 'automated queries', 'captcha',
-                'blocked', 'our systems have detected'
-            ]):
-                logger.warning("⚠️ Google anti-bot protection detected")
-                raise HTTPException(
-                    status_code=429,
-                    detail="Google heeft ongebruikelijk verkeer gedetecteerd. Probeer later opnieuw."
-                )
+            blocking_indicators = ['unusual traffic', 'automated queries', 'captcha', 'blocked', 'our systems have detected']
+            found_indicators = [indicator for indicator in blocking_indicators if indicator in content_lower]
+            
+            if found_indicators:
+                logger.warning(f"⚠️ Google blocking indicators found: {found_indicators}")
+                # Don't raise exception yet, try to parse anyway
+            
+            # Log some sample content for debugging
+            sample_content = response.text[:2000] if len(response.text) > 2000 else response.text
+            logger.info(f"📄 HTML sample (first 2000 chars): {sample_content}")
             
             # Check if we got actual search results
-            if 'did not match any documents' in content_lower or len(response.text) < 10000:
-                logger.warning(f"⚠️ Mogelijk geblokkeerd of geen resultaten voor: {keyword}")
+            has_search_content = any(indicator in content_lower for indicator in [
+                'search results', 'about', 'results', 'web', 'images'
+            ])
+            
+            if not has_search_content:
+                logger.warning(f"⚠️ Response doesn't look like search results page")
+                
+            # Try to find common Google search page elements
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for search form (indicates we're on a search page)
+            search_form = soup.select_one('form[action="/search"]')
+            logger.info(f"🔍 Search form found: {search_form is not None}")
+            
+            # Look for result stats
+            result_stats = soup.select_one('#result-stats') or soup.select_one('.result-stats')
+            if result_stats:
+                logger.info(f"📊 Result stats found: {result_stats.get_text()[:100]}")
+            
+            # Count different element types
+            div_g_count = len(soup.select('div.g'))
+            yuRUbf_count = len(soup.select('.yuRUbf'))
+            tF2Cxc_count = len(soup.select('.tF2Cxc'))
+            all_links = len(soup.select('a[href]'))
+            
+            logger.info(f"🧮 Element counts - div.g: {div_g_count}, .yuRUbf: {yuRUbf_count}, .tF2Cxc: {tF2Cxc_count}, links: {all_links}")
             
             results = self.extract_search_results(response.text)
             
             if not results:
                 logger.warning(f"🔍 Geen zoekresultaten gevonden voor '{keyword}' in {country}")
+                
+                # Additional debugging: save HTML to check manually
+                if len(response.text) > 1000:
+                    # In development, we could save this to a file
+                    logger.info("💡 Consider saving response HTML for manual inspection")
+            else:
+                logger.info(f"✅ Successfully found {len(results)} results")
             
             return results
             

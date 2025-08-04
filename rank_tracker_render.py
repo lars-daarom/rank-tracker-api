@@ -126,7 +126,54 @@ class DatabaseManager:
     
     def execute_query(self, query: str, params: tuple = (), fetch: str = None):
         """Execute query met error handling"""
-        try:
+    def extract_simple_results(self, soup) -> List[Dict[str, Any]]:
+        """Simplified extraction method as fallback"""
+        results = []
+        position = 1
+        
+        # Look for any links that could be search results
+        # Try to find patterns that indicate organic results
+        potential_results = []
+        
+        # Strategy 1: Look for external links in any container
+        containers = soup.select('div, article, section')
+        for container in containers:
+            links = container.select('a[href^="http"]:not([href*="google"]):not([href*="youtube.com/results"])')
+            if links:
+                for link in links:
+                    # Skip obvious ads and navigation
+                    href = link.get('href', '')
+                    if any(skip in href.lower() for skip in ['googleadservices', '/aclk', 'accounts.google']):
+                        continue
+                    
+                    # Look for title in the link or nearby
+                    title = link.get_text().strip()
+                    if not title:
+                        # Look for h3 near the link
+                        h3 = container.select_one('h3')
+                        if h3:
+                            title = h3.get_text().strip()
+                    
+                    if title and len(title) > 10:  # Reasonable title length
+                        try:
+                            domain = urlparse(href).netloc.replace('www.', '').lower()
+                            if domain:
+                                potential_results.append({
+                                    'position': position,
+                                    'url': href,
+                                    'title': title,
+                                    'domain': domain,
+                                    'snippet': ''
+                                })
+                                position += 1
+                                
+                                if len(potential_results) >= 10:  # Limit results
+                                    break
+                        except:
+                            continue
+        
+        logger.info(f"🔄 Simple extraction found {len(potential_results)} potential results")
+        return potential_results[:10]  # Return max 10 results
             conn = self.get_connection()
             cursor = conn.cursor()
             
@@ -181,21 +228,13 @@ class GoogleRankTracker:
         }
     
     def get_random_headers(self) -> Dict[str, str]:
-        """Generate random headers om detectie te voorkomen"""
+        """Minimal, browser-like headers"""
         return {
             'User-Agent': random.choice(self.user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate',  # Changed from 'gzip, deflate, br'
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0',
-            'DNT': '1',
-            'Sec-GPC': '1'
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
         }
     
     def clean_domain(self, domain: str) -> str:
@@ -205,31 +244,43 @@ class GoogleRankTracker:
         return domain.replace('www.', '').lower().strip()
     
     def build_google_url(self, keyword: str, country: str = 'nl', num_results: int = 100) -> str:
-        """Build Google search URL met country-specific settings"""
-        config = self.google_config.get(country, self.google_config['nl'])
+        """Build simple Google search URL like a real browser"""
+        # Always use google.com regardless of country
+        base_url = "https://www.google.com/search"
         
-        base_url = f"https://www.{config['domain']}/search"
+        # Minimal parameters - just like your example
         params = {
             'q': keyword,
-            'num': num_results,
-            'hl': config['lang'],
-            'gl': config['gl'],
-            'start': 0,
-            'pws': '0',  # Disable personalization
-            'safe': 'off',
-            'filter': '0'  # No duplicate filtering
         }
         
+        # Only add extra params if really needed
+        if num_results != 10:  # Google's default is 10
+            params['num'] = min(num_results, 100)
+            
+        if country != 'us':  # Only specify country if not US
+            # Use hl (interface language) instead of gl (geolocation)
+            country_lang = {
+                'nl': 'nl',
+                'be': 'nl', 
+                'de': 'de',
+                'uk': 'en'
+            }
+            if country in country_lang:
+                params['hl'] = country_lang[country]
+        
         query_string = '&'.join([f"{k}={quote_plus(str(v))}" for k, v in params.items()])
-        return f"{base_url}?{query_string}"
+        url = f"{base_url}?{query_string}"
+        
+        logger.info(f"🌐 Built URL: {url}")
+        return url
     
     async def rate_limit(self):
-        """Implement rate limiting"""
+        """Conservative rate limiting"""
         current_time = time.time()
         time_diff = current_time - self.last_request_time
         
         if time_diff < self.request_delay:
-            sleep_time = self.request_delay - time_diff + random.uniform(0.5, 1.5)  # Add jitter
+            sleep_time = self.request_delay - time_diff + random.uniform(1.0, 3.0)  # More random delay
             logger.info(f"⏳ Rate limiting: waiting {sleep_time:.1f}s")
             await asyncio.sleep(sleep_time)
         
@@ -429,90 +480,59 @@ class GoogleRankTracker:
         logger.info(f"🌐 URL: {url[:100]}...")
         
         try:
-            response = self.session.get(
+            # Use a fresh session for each request to avoid tracking
+            session = requests.Session()
+            
+            response = session.get(
                 url, 
                 headers=headers, 
-                timeout=15,
+                timeout=20,
                 allow_redirects=True
             )
             response.raise_for_status()
             
             # Ensure proper text decoding
-            response.encoding = response.apparent_encoding or 'utf-8'
+            if response.encoding is None:
+                response.encoding = 'utf-8'
             html_content = response.text
             
             logger.info(f"📡 Response status: {response.status_code}")
             logger.info(f"📏 Response length: {len(html_content)} characters")
-            logger.info(f"🔤 Response encoding: {response.encoding}")
             
-            # Verify we got readable HTML
-            if html_content.startswith('<!DOCTYPE html') or '<html' in html_content[:100]:
+            # Check if we got readable HTML
+            if '<!DOCTYPE html' in html_content or '<html' in html_content:
                 logger.info("✅ Got valid HTML content")
             else:
-                logger.warning("⚠️ Response doesn't start with HTML - possible encoding issue")
-                # Try different encoding
-                try:
-                    html_content = response.content.decode('utf-8', errors='ignore')
-                    logger.info("🔄 Tried UTF-8 decoding")
-                except:
-                    html_content = response.content.decode('latin-1', errors='ignore')
-                    logger.info("🔄 Tried Latin-1 decoding")
+                logger.warning("⚠️ Response doesn't look like HTML")
+                # Log first 500 chars to see what we got
+                logger.info(f"Response start: {html_content[:500]}")
             
-            # Check for blocking indicators
-            content_lower = html_content.lower()
-            blocking_indicators = ['unusual traffic', 'automated queries', 'captcha', 'blocked', 'our systems have detected']
-            found_indicators = [indicator for indicator in blocking_indicators if indicator in content_lower]
+            # Check for Google blocking
+            if any(block in html_content.lower() for block in [
+                'unusual traffic', 'captcha', 'blocked', 'automated queries'
+            ]):
+                logger.warning("🚫 Google blocking detected")
+                return []
             
-            if found_indicators:
-                logger.warning(f"⚠️ Google blocking indicators found: {found_indicators}")
-                # Don't raise exception yet, try to parse anyway
-            
-            # Log some sample content for debugging
-            sample_content = html_content[:1000] if len(html_content) > 1000 else html_content
-            logger.info(f"📄 HTML sample (first 1000 chars): {sample_content}")
-            
-            # Check if we got actual search results
-            has_search_content = any(indicator in content_lower for indicator in [
-                'search results', 'about', 'results', 'web', 'images', 'google search'
-            ])
-            
-            if has_search_content:
-                logger.info("✅ Response looks like search results page")
-            else:
-                logger.warning(f"⚠️ Response doesn't look like search results page")
-                
-            # Try to find common Google search page elements
+            # Parse with BeautifulSoup
             soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Look for search form (indicates we're on a search page)
-            search_form = soup.select_one('form[action="/search"]') or soup.select_one('form[action*="search"]')
-            logger.info(f"🔍 Search form found: {search_form is not None}")
+            # Count elements for debugging
+            div_g = soup.select('div.g')
+            yuRUbf = soup.select('.yuRUbf') 
+            search_divs = soup.select('div[data-hveid]')
+            all_links = soup.select('a[href^="http"]')
             
-            # Look for result stats
-            result_stats = soup.select_one('#result-stats') or soup.select_one('.result-stats')
-            if result_stats:
-                logger.info(f"📊 Result stats found: {result_stats.get_text()[:100]}")
+            logger.info(f"🧮 Found elements - div.g: {len(div_g)}, .yuRUbf: {len(yuRUbf)}, data-hveid: {len(search_divs)}, external links: {len(all_links)}")
             
-            # Count different element types
-            div_g_count = len(soup.select('div.g'))
-            yuRUbf_count = len(soup.select('.yuRUbf'))
-            tF2Cxc_count = len(soup.select('.tF2Cxc'))
-            all_links = len(soup.select('a[href]'))
-            
-            logger.info(f"🧮 Element counts - div.g: {div_g_count}, .yuRUbf: {yuRUbf_count}, .tF2Cxc: {tF2Cxc_count}, links: {all_links}")
-            
+            # Try different extraction strategies
             results = self.extract_search_results(html_content)
             
             if not results:
-                logger.warning(f"🔍 Geen zoekresultaten gevonden voor '{keyword}' in {country}")
-                
-                # Additional debugging: save HTML to check manually
-                if len(html_content) > 1000:
-                    # In development, we could save this to a file
-                    logger.info("💡 Consider saving response HTML for manual inspection")
-            else:
-                logger.info(f"✅ Successfully found {len(results)} results")
+                # Try alternative extraction if main method fails
+                results = self.extract_simple_results(soup)
             
+            session.close()
             return results
             
         except requests.exceptions.Timeout:

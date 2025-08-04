@@ -186,7 +186,7 @@ class GoogleRankTracker:
             'User-Agent': random.choice(self.user_agents),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'nl-NL,nl;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'gzip, deflate',  # Changed from 'gzip, deflate, br'
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
             'Sec-Fetch-Dest': 'document',
@@ -437,11 +437,29 @@ class GoogleRankTracker:
             )
             response.raise_for_status()
             
+            # Ensure proper text decoding
+            response.encoding = response.apparent_encoding or 'utf-8'
+            html_content = response.text
+            
             logger.info(f"📡 Response status: {response.status_code}")
-            logger.info(f"📏 Response length: {len(response.text)} characters")
+            logger.info(f"📏 Response length: {len(html_content)} characters")
+            logger.info(f"🔤 Response encoding: {response.encoding}")
+            
+            # Verify we got readable HTML
+            if html_content.startswith('<!DOCTYPE html') or '<html' in html_content[:100]:
+                logger.info("✅ Got valid HTML content")
+            else:
+                logger.warning("⚠️ Response doesn't start with HTML - possible encoding issue")
+                # Try different encoding
+                try:
+                    html_content = response.content.decode('utf-8', errors='ignore')
+                    logger.info("🔄 Tried UTF-8 decoding")
+                except:
+                    html_content = response.content.decode('latin-1', errors='ignore')
+                    logger.info("🔄 Tried Latin-1 decoding")
             
             # Check for blocking indicators
-            content_lower = response.text.lower()
+            content_lower = html_content.lower()
             blocking_indicators = ['unusual traffic', 'automated queries', 'captcha', 'blocked', 'our systems have detected']
             found_indicators = [indicator for indicator in blocking_indicators if indicator in content_lower]
             
@@ -450,22 +468,24 @@ class GoogleRankTracker:
                 # Don't raise exception yet, try to parse anyway
             
             # Log some sample content for debugging
-            sample_content = response.text[:2000] if len(response.text) > 2000 else response.text
-            logger.info(f"📄 HTML sample (first 2000 chars): {sample_content}")
+            sample_content = html_content[:1000] if len(html_content) > 1000 else html_content
+            logger.info(f"📄 HTML sample (first 1000 chars): {sample_content}")
             
             # Check if we got actual search results
             has_search_content = any(indicator in content_lower for indicator in [
-                'search results', 'about', 'results', 'web', 'images'
+                'search results', 'about', 'results', 'web', 'images', 'google search'
             ])
             
-            if not has_search_content:
+            if has_search_content:
+                logger.info("✅ Response looks like search results page")
+            else:
                 logger.warning(f"⚠️ Response doesn't look like search results page")
                 
             # Try to find common Google search page elements
-            soup = BeautifulSoup(response.text, 'html.parser')
+            soup = BeautifulSoup(html_content, 'html.parser')
             
             # Look for search form (indicates we're on a search page)
-            search_form = soup.select_one('form[action="/search"]')
+            search_form = soup.select_one('form[action="/search"]') or soup.select_one('form[action*="search"]')
             logger.info(f"🔍 Search form found: {search_form is not None}")
             
             # Look for result stats
@@ -481,13 +501,13 @@ class GoogleRankTracker:
             
             logger.info(f"🧮 Element counts - div.g: {div_g_count}, .yuRUbf: {yuRUbf_count}, .tF2Cxc: {tF2Cxc_count}, links: {all_links}")
             
-            results = self.extract_search_results(response.text)
+            results = self.extract_search_results(html_content)
             
             if not results:
                 logger.warning(f"🔍 Geen zoekresultaten gevonden voor '{keyword}' in {country}")
                 
                 # Additional debugging: save HTML to check manually
-                if len(response.text) > 1000:
+                if len(html_content) > 1000:
                     # In development, we could save this to a file
                     logger.info("💡 Consider saving response HTML for manual inspection")
             else:

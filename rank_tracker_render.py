@@ -111,22 +111,40 @@ class SimpleGoogleScraper:
         ]
     
     def get_headers(self):
+        """More realistic browser headers"""
         return {
             'User-Agent': random.choice(self.user_agents),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive'
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'sec-ch-ua': '"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"'
         }
     
     def build_url(self, keyword: str, country: str = 'nl'):
-        """Build simple Google URL"""
+        """Build Google URL with parameters to avoid JS redirect"""
+        # Add parameters to signal we're a capable browser
         url = f"https://www.google.com/search?q={quote_plus(keyword)}"
+        
+        # Add num parameter to request more results (signals serious browser)
+        url += "&num=20"
         
         if country != 'us':
             country_lang = {'nl': 'nl', 'be': 'nl', 'de': 'de', 'uk': 'en'}
             if country in country_lang:
                 url += f"&hl={country_lang[country]}"
+        
+        # Add parameters that real browsers send
+        url += "&source=hp"  # Homepage source
+        url += "&ei=muu123"  # Event ID (can be static)
         
         logger.info(f"🌐 URL: {url}")
         return url
@@ -349,7 +367,7 @@ class SimpleGoogleScraper:
         return results
     
     async def search(self, keyword: str, country: str = 'nl') -> List[Dict[str, Any]]:
-        """Perform Google search"""
+        """Perform Google search with better browser simulation"""
         await self.rate_limit()
         
         url = self.build_url(keyword, country)
@@ -358,7 +376,19 @@ class SimpleGoogleScraper:
         try:
             logger.info(f"🔍 Searching: '{keyword}' in {country}")
             
-            response = self.session.get(url, headers=headers, timeout=20)
+            # Create a new session with cookies enabled
+            session = requests.Session()
+            
+            # First, visit Google homepage to get cookies (like a real browser)
+            logger.info("🍪 Getting Google cookies...")
+            homepage_response = session.get('https://www.google.com/', headers=headers, timeout=10)
+            logger.info(f"🏠 Homepage status: {homepage_response.status_code}")
+            
+            # Small delay like a real user
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            
+            # Now perform the search
+            response = session.get(url, headers=headers, timeout=20)
             response.raise_for_status()
             
             # Check encoding
@@ -368,6 +398,22 @@ class SimpleGoogleScraper:
             html = response.text
             logger.info(f"📡 Status: {response.status_code}, Length: {len(html)}")
             
+            # Check for JavaScript redirect page
+            if 'enablejs' in html.lower() or len(html) < 20000:
+                logger.warning("⚠️ Got JavaScript redirect page - trying alternative approach")
+                
+                # Try with different headers
+                alt_headers = headers.copy()
+                alt_headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                alt_headers.pop('sec-ch-ua', None)
+                alt_headers.pop('sec-ch-ua-mobile', None)
+                alt_headers.pop('sec-ch-ua-platform', None)
+                
+                await asyncio.sleep(2)
+                response = session.get(url, headers=alt_headers, timeout=20)
+                html = response.text
+                logger.info(f"📡 Alternative attempt - Status: {response.status_code}, Length: {len(html)}")
+            
             # Check for blocking
             if any(block in html.lower() for block in ['unusual traffic', 'captcha', 'blocked']):
                 logger.warning("🚫 Google blocking detected")
@@ -376,9 +422,11 @@ class SimpleGoogleScraper:
             # Basic HTML check
             if not ('<!DOCTYPE html' in html or '<html' in html):
                 logger.warning("⚠️ Invalid HTML response")
+                logger.info(f"Response start: {html[:200]}")
                 return []
                 
             results = self.extract_results(html)
+            session.close()
             return results
             
         except Exception as e:

@@ -111,18 +111,14 @@ class SimpleGoogleScraper:
         ]
     
     def get_headers(self):
-        """More realistic browser headers"""
+        """Headers without Brotli to avoid compression issues"""
         return {
             'User-Agent': random.choice(self.user_agents),
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9,nl;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept-Encoding': 'gzip, deflate',  # Remove 'br' to avoid Brotli
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
             'Cache-Control': 'max-age=0',
             'sec-ch-ua': '"Chromium";v="120", "Google Chrome";v="120", "Not_A Brand";v="99"',
             'sec-ch-ua-mobile': '?0',
@@ -413,25 +409,52 @@ class SimpleGoogleScraper:
                 import zlib
                 
                 try:
-                    # Try gzip first
-                    if response.headers.get('content-encoding') == 'gzip':
+                    content_encoding = response.headers.get('content-encoding', '').lower()
+                    logger.info(f"🔍 Content encoding detected: {content_encoding}")
+                    
+                    if content_encoding == 'gzip':
                         html = gzip.decompress(response.content).decode('utf-8', errors='ignore')
                         logger.info("✅ Gzip decompression successful")
-                    elif response.headers.get('content-encoding') == 'deflate':
+                    elif content_encoding == 'deflate':
                         html = zlib.decompress(response.content).decode('utf-8', errors='ignore')
                         logger.info("✅ Deflate decompression successful")
+                    elif content_encoding == 'br':
+                        # Brotli compression - try to install brotli or avoid it
+                        try:
+                            import brotli
+                            html = brotli.decompress(response.content).decode('utf-8', errors='ignore')
+                            logger.info("✅ Brotli decompression successful")
+                        except ImportError:
+                            logger.warning("⚠️ Brotli not available - this should not happen with our headers")
+                            # Fallback: make new request without br in accept-encoding
+                            fallback_headers = headers.copy()
+                            fallback_headers['Accept-Encoding'] = 'gzip, deflate'
+                            await asyncio.sleep(1)
+                            fallback_response = session.get(url, headers=fallback_headers, timeout=20)
+                            html = fallback_response.text
+                            logger.info("🔄 Fallback request without Brotli successful")
                     else:
-                        # Try both anyway
+                        # Try both gzip and deflate anyway
                         try:
                             html = gzip.decompress(response.content).decode('utf-8', errors='ignore')
                             logger.info("✅ Force gzip decompression successful")
                         except:
-                            html = response.content.decode('utf-8', errors='ignore')
-                            logger.info("✅ Raw decode successful")
+                            try:
+                                html = zlib.decompress(response.content).decode('utf-8', errors='ignore')
+                                logger.info("✅ Force deflate decompression successful")
+                            except:
+                                html = response.content.decode('utf-8', errors='ignore')
+                                logger.info("✅ Raw decode successful")
                             
                 except Exception as decomp_error:
                     logger.error(f"❌ Decompression failed: {decomp_error}")
-                    html = response.content.decode('utf-8', errors='ignore')
+                    # Last resort: try different encoding
+                    try:
+                        html = response.content.decode('latin-1', errors='ignore')
+                        logger.info("🔄 Latin-1 decode attempt")
+                    except:
+                        html = str(response.content, errors='ignore')
+                        logger.info("🔄 String conversion attempt")
             
             # Log the corrected HTML start
             corrected_start = html[:200]

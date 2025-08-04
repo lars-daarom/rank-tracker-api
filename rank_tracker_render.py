@@ -240,13 +240,31 @@ class GoogleRankTracker:
         soup = BeautifulSoup(html_content, 'html.parser')
         results = []
         
-        # Multiple selectors voor verschillende Google layouts
+        # Check if we got blocked first
+        if any(indicator in html_content.lower() for indicator in [
+            'unusual traffic', 'captcha', 'blocked'
+        ]):
+            logger.warning("🚫 Google blocking detected in HTML content")
+            return results
+        
+        # Comprehensive selectors for different Google layouts (2024/2025)
         selectors = [
-            'div.g:has(div.yuRUbf)',  # Moderne layout
-            'div.g:has(> div > div > a)',  # Alternative
-            'div[data-hveid]:has(h3)',  # Data-driven selector
-            '.tF2Cxc',  # Classic selector
-            'div.g'  # Fallback
+            # Modern layouts
+            'div.g div.yuRUbf',           # Current primary
+            'div.g:has(div.yuRUbf)',      # Alternative modern
+            'div[data-hveid] div.yuRUbf', # Data attribute version
+            
+            # Classic layouts  
+            '.tF2Cxc',                    # Classic container
+            'div.g .rc',                  # Older classic
+            
+            # Fallback broader selectors
+            'div.g:has(h3)',              # Any div.g with h3
+            'div[data-hveid]:has(h3)',    # Data divs with h3
+            'div.g',                      # Broadest fallback
+            
+            # Link-based selectors
+            'div:has(> a[href^="http"]):has(h3)', # Divs with external links and h3
         ]
         
         elements = []
@@ -255,64 +273,135 @@ class GoogleRankTracker:
         for selector in selectors:
             try:
                 elements = soup.select(selector)
-                if elements and len(elements) > 3:  # Need reasonable amount
+                # Filter out empty or ad results
+                valid_elements = []
+                for elem in elements:
+                    # Must have a proper link
+                    link = elem.select_one('a[href]')
+                    if link and link.get('href'):
+                        href = link.get('href')
+                        # Skip ads and Google's own links
+                        if not any(skip in href.lower() for skip in [
+                            '/aclk?', 'googleadservices', '/search?', 'accounts.google'
+                        ]):
+                            valid_elements.append(elem)
+                
+                if valid_elements and len(valid_elements) >= 3:
+                    elements = valid_elements
                     used_selector = selector
-                    logger.info(f"🎯 Using selector '{selector}' - found {len(elements)} elements")
+                    logger.info(f"🎯 Using selector '{selector}' - found {len(elements)} valid elements")
                     break
+                    
             except Exception as e:
                 logger.warning(f"Selector '{selector}' failed: {e}")
                 continue
         
         if not elements:
             logger.warning("❌ No search results found with any selector")
-            # Log a sample of HTML voor debugging
-            logger.debug(f"HTML sample: {html_content[:500]}...")
+            # Log more detailed HTML sample for debugging
+            sample_html = html_content[:1000] if len(html_content) > 1000 else html_content
+            logger.warning(f"HTML sample (first 1000 chars): {sample_html}")
+            
+            # Try to find any links at all for debugging
+            all_links = soup.select('a[href]')
+            logger.info(f"🔍 Found {len(all_links)} total links in page")
+            
+            # Look for common Google elements
+            google_divs = soup.select('div.g')
+            logger.info(f"🔍 Found {len(google_divs)} div.g elements")
+            
             return results
         
         position = 1
         for element in elements[:100]:  # Max 100 results
             try:
-                # Find the main link
-                link_elem = element.select_one('a[href]')
-                if not link_elem:
+                # Strategy 1: yuRUbf container (modern Google)
+                link_container = element.select_one('div.yuRUbf a') or element.select_one('.yuRUbf a')
+                
+                # Strategy 2: Direct link in element
+                if not link_container:
+                    link_container = element.select_one('a[href]')
+                
+                # Strategy 3: First valid link in element
+                if not link_container:
+                    all_links = element.select('a[href]')
+                    for link in all_links:
+                        href = link.get('href', '')
+                        if href.startswith('http') and 'google.' not in href:
+                            link_container = link
+                            break
+                
+                if not link_container:
                     continue
                 
-                url = link_elem.get('href', '')
+                url = link_container.get('href', '')
                 
-                # Skip Google's own results en ads
-                if any(skip in url.lower() for skip in [
-                    '/search', 'google.', 'youtube.com/results', 
-                    'maps.google', '/aclk?', 'googleadservices'
-                ]):
-                    continue
-                
-                # Clean URL (handle /url?q= redirects)
+                # Clean and validate URL
                 if url.startswith('/url?q='):
                     try:
-                        url = url.split('/url?q=')[1].split('&')[0]
-                        from urllib.parse import unquote
-                        url = unquote(url)
+                        from urllib.parse import unquote, parse_qs, urlparse as parse_url
+                        parsed = parse_url(url)
+                        if parsed.query:
+                            query_params = parse_qs(parsed.query)
+                            if 'q' in query_params:
+                                url = unquote(query_params['q'][0])
                     except:
                         continue
                 
-                if not url.startswith('http'):
+                # Skip invalid URLs
+                if not url.startswith('http') or any(skip in url.lower() for skip in [
+                    'google.', 'youtube.com/results', 'maps.google', '/aclk?', 
+                    'googleadservices', 'accounts.google', '/search'
+                ]):
                     continue
                 
-                # Extract title
-                title_elem = element.select_one('h3')
-                title = title_elem.get_text().strip() if title_elem else "No title"
+                # Extract title - multiple strategies
+                title = None
                 
-                # Extract snippet
-                snippet_elem = element.select_one('span:contains("...")')  
-                snippet = snippet_elem.get_text().strip()[:200] if snippet_elem else ""
+                # Strategy 1: h3 tag (most common)
+                title_elem = element.select_one('h3')
+                if title_elem:
+                    title = title_elem.get_text().strip()
+                
+                # Strategy 2: Link text if no h3
+                if not title and link_container:
+                    title = link_container.get_text().strip()
+                
+                # Strategy 3: aria-label or other attributes
+                if not title:
+                    for attr in ['aria-label', 'title']:
+                        if link_container.get(attr):
+                            title = link_container.get(attr).strip()
+                            break
+                
+                if not title:
+                    title = "No title found"
+                
+                # Extract snippet/description
+                snippet = ""
+                snippet_selectors = [
+                    '.VwiC3b',      # Modern snippet
+                    '.s',           # Classic snippet  
+                    '.st',          # Alternative snippet
+                    'span:contains("...")',  # Ellipsis indicator
+                    '.IsZvec'       # Another modern class
+                ]
+                
+                for snippet_sel in snippet_selectors:
+                    snippet_elem = element.select_one(snippet_sel)
+                    if snippet_elem:
+                        snippet = snippet_elem.get_text().strip()[:200]
+                        break
                 
                 # Extract domain
                 try:
-                    domain = urlparse(url).netloc.replace('www.', '').lower()
+                    from urllib.parse import urlparse
+                    parsed_url = urlparse(url)
+                    domain = parsed_url.netloc.replace('www.', '').lower()
                 except:
                     continue
                 
-                if domain:  # Only add if we have a valid domain
+                if domain and title != "No title found":  # Only add quality results
                     results.append({
                         'position': position,
                         'url': url,
@@ -323,10 +412,10 @@ class GoogleRankTracker:
                     position += 1
                 
             except Exception as e:
-                logger.error(f"Error extracting result: {e}")
+                logger.error(f"Error extracting result at position {position}: {e}")
                 continue
         
-        logger.info(f"✅ Extracted {len(results)} valid search results")
+        logger.info(f"✅ Successfully extracted {len(results)} valid search results")
         return results
     
     async def search_google(self, keyword: str, country: str = 'nl') -> List[Dict[str, Any]]:

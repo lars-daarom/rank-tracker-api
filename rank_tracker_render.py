@@ -72,7 +72,7 @@ security = HTTPBearer(auto_error=False) if API_KEY else None
 class RankRequest(BaseModel):
     keyword: str = Field(..., min_length=1, max_length=255, description="Zoekwoord om te checken")
     domain: str = Field(..., min_length=1, max_length=255, description="Domein om te zoeken")
-    country: str = Field(default="nl", regex="^(nl|be|de|uk|us)$", description="Land code")
+    country: str = Field(default="nl", pattern="^(nl|be|de|uk|us)$", description="Land code")
 
 class RankResponse(BaseModel):
     position: Optional[int] = Field(None, description="Positie in zoekresultaten (null = niet gevonden)")

@@ -144,48 +144,146 @@ class SimpleGoogleScraper:
         self.last_request = time.time()
     
     def extract_results(self, html: str) -> List[Dict[str, Any]]:
-        """Extract search results"""
+        """Extract search results with debugging"""
         soup = BeautifulSoup(html, 'html.parser')
         results = []
         position = 1
         
-        # Try different selectors
-        selectors = [
-            'div.g div.yuRUbf a',  # Modern
-            'div.g a[href^="http"]',  # Classic
-            'div[data-hveid] a[href^="http"]',  # Alternative
-            'a[href^="http"]:has(h3)'  # Broad
+        # Debug: Let's see what elements exist
+        all_divs = soup.select('div')
+        g_divs = soup.select('div.g')
+        h3_elements = soup.select('h3')
+        all_links = soup.select('a[href]')
+        http_links = soup.select('a[href^="http"]')
+        
+        logger.info(f"🔍 Debug counts - Total divs: {len(all_divs)}, div.g: {len(g_divs)}, h3: {len(h3_elements)}, all links: {len(all_links)}, http links: {len(http_links)}")
+        
+        # Sample some elements to understand structure
+        if h3_elements:
+            logger.info(f"📝 First h3 text: {h3_elements[0].get_text()[:50]}...")
+        
+        if all_links:
+            sample_hrefs = [link.get('href', '')[:50] for link in all_links[:5]]
+            logger.info(f"🔗 Sample hrefs: {sample_hrefs}")
+        
+        # Try various extraction strategies
+        strategies = [
+            # Strategy 1: Look for h3 elements and find their parent links
+            ('h3_parent_links', lambda: self.extract_h3_links(soup)),
+            
+            # Strategy 2: Find all external links and filter
+            ('external_links', lambda: self.extract_external_links(soup)),
+            
+            # Strategy 3: Look for common Google result patterns
+            ('result_patterns', lambda: self.extract_result_patterns(soup)),
         ]
         
-        for selector in selectors:
+        for strategy_name, strategy_func in strategies:
             try:
-                links = soup.select(selector)
-                logger.info(f"🔍 Selector '{selector}' found {len(links)} links")
+                strategy_results = strategy_func()
+                logger.info(f"🎯 Strategy '{strategy_name}' found {len(strategy_results)} results")
                 
-                for link in links[:20]:  # Max 20 results
-                    href = link.get('href', '')
+                if strategy_results:
+                    results = strategy_results
+                    break
                     
-                    # Skip Google's own links
-                    if any(skip in href.lower() for skip in [
-                        'google.', 'youtube.com/results', '/aclk?', 'googleadservices'
-                    ]):
-                        continue
-                    
-                    # Get title
-                    title_elem = link.select_one('h3') or link.find_parent().select_one('h3')
-                    title = title_elem.get_text().strip() if title_elem else link.get_text().strip()
-                    
-                    if not title or len(title) < 5:
-                        continue
-                    
-                    # Get domain
-                    try:
-                        domain = urlparse(href).netloc.replace('www.', '').lower()
-                        if not domain:
-                            continue
-                    except:
-                        continue
-                    
+            except Exception as e:
+                logger.error(f"Strategy '{strategy_name}' failed: {e}")
+                continue
+        
+        logger.info(f"✅ Final extraction: {len(results)} results")
+        return results
+    
+    def extract_h3_links(self, soup) -> List[Dict[str, Any]]:
+        """Extract by finding h3 elements and their parent links"""
+        results = []
+        position = 1
+        
+        h3_elements = soup.select('h3')
+        
+        for h3 in h3_elements:
+            # Look for a link that contains or is near this h3
+            link = None
+            
+            # Check if h3 is inside a link
+            link = h3.find_parent('a')
+            
+            # If not, look for a link near the h3
+            if not link:
+                # Look in parent container
+                parent = h3.find_parent()
+                if parent:
+                    link = parent.select_one('a[href^="http"]')
+            
+            # Check siblings
+            if not link and h3.parent:
+                link = h3.parent.select_one('a[href^="http"]')
+            
+            if link:
+                href = link.get('href', '')
+                
+                # Skip Google's own links
+                if any(skip in href.lower() for skip in [
+                    'google.', 'youtube.com/results', '/aclk?', 'googleadservices', 'accounts.google'
+                ]):
+                    continue
+                
+                title = h3.get_text().strip()
+                if len(title) < 5:
+                    continue
+                
+                try:
+                    domain = urlparse(href).netloc.replace('www.', '').lower()
+                    if domain:
+                        results.append({
+                            'position': position,
+                            'url': href,
+                            'title': title,
+                            'domain': domain
+                        })
+                        position += 1
+                        
+                        if len(results) >= 20:  # Max 20 results
+                            break
+                except:
+                    continue
+        
+        return results
+    
+    def extract_external_links(self, soup) -> List[Dict[str, Any]]:
+        """Extract by finding all external links and filtering"""
+        results = []
+        position = 1
+        
+        links = soup.select('a[href^="http"]')
+        
+        for link in links:
+            href = link.get('href', '')
+            
+            # Skip unwanted links
+            if any(skip in href.lower() for skip in [
+                'google.', 'youtube.com/results', '/aclk?', 'googleadservices', 
+                'accounts.google', 'maps.google', 'translate.google'
+            ]):
+                continue
+            
+            # Get title from link text or nearby h3
+            title = link.get_text().strip()
+            
+            if not title or len(title) < 5:
+                # Look for h3 in parent or children
+                parent = link.find_parent()
+                if parent:
+                    h3 = parent.select_one('h3')
+                    if h3:
+                        title = h3.get_text().strip()
+            
+            if not title or len(title) < 5:
+                continue
+            
+            try:
+                domain = urlparse(href).netloc.replace('www.', '').lower()
+                if domain:
                     results.append({
                         'position': position,
                         'url': href,
@@ -193,15 +291,61 @@ class SimpleGoogleScraper:
                         'domain': domain
                     })
                     position += 1
-                
-                if results:
-                    break  # Found results, stop trying selectors
                     
-            except Exception as e:
-                logger.error(f"Selector error: {e}")
+                    if len(results) >= 20:
+                        break
+            except:
                 continue
         
-        logger.info(f"✅ Extracted {len(results)} results")
+        return results
+    
+    def extract_result_patterns(self, soup) -> List[Dict[str, Any]]:
+        """Extract using common Google result patterns"""
+        results = []
+        position = 1
+        
+        # Look for containers that might hold results
+        containers = soup.select('div[data-hveid], div[data-async-context], div.g, div[jscontroller]')
+        
+        for container in containers:
+            # Look for external links in this container
+            links = container.select('a[href^="http"]')
+            
+            for link in links:
+                href = link.get('href', '')
+                
+                # Skip unwanted
+                if any(skip in href.lower() for skip in [
+                    'google.', 'youtube.com/results', '/aclk?', 'googleadservices'
+                ]):
+                    continue
+                
+                # Must have a reasonable title
+                title = link.get_text().strip()
+                
+                # Look for h3 near this link
+                if not title or len(title) < 10:
+                    h3 = container.select_one('h3')
+                    if h3:
+                        title = h3.get_text().strip()
+                
+                if title and len(title) >= 10:
+                    try:
+                        domain = urlparse(href).netloc.replace('www.', '').lower()
+                        if domain:
+                            results.append({
+                                'position': position,
+                                'url': href,
+                                'title': title,
+                                'domain': domain
+                            })
+                            position += 1
+                            
+                            if len(results) >= 20:
+                                return results
+                    except:
+                        continue
+        
         return results
     
     async def search(self, keyword: str, country: str = 'nl') -> List[Dict[str, Any]]:
